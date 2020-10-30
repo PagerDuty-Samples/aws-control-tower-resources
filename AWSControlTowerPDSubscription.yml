@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion:                     2010-09-09
+Description:                                  This template creates the SNS subscription required for the 'Streamline AWS Control Tower multi-account environments with PagerDuty Service Ownership' blog in the AWS Control Tower Audit account. (MPCT-tnhjwbbr)
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default:                            SNS Subscription Configuration
+        Parameters:
+          - AuditTopicName
+          - PagerDutyHttpsEndpoint
+    ParameterLabels:
+      AuditTopicARN:
+        default:                              'Enter the ARN of the aws-controltower-AggregateSecurityNotifications topic'
+      PagerDutyHttpsEndpoint:
+        default:                              'Enter your PagerDuty HTTPS Endpoint'
+Resources:
+  AggregateSecurityNotificationsSubscription:
+    Type:                                     'AWS::SNS::Subscription'
+    Properties:
+      TopicArn:                               !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AuditTopicName}
+      Endpoint:                               !Ref PagerDutyHttpsEndpoint
+      Protocol:                               https
+  SNSSubscriptionFlipExecutionRole:
+    Type:                                     AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id:                               W11
+            reason:                           "Only all resources are supported for the SNS APIs allowed."
+    Properties:
+      AssumeRolePolicyDocument:
+        Version:                              '2012-10-17'
+        Statement:
+          - Effect:                           Allow
+            Principal:
+              Service:                        lambda.amazonaws.com
+            Action:                           sts:AssumeRole
+      Path:                                   /
+      Policies:
+        - PolicyName:                         SNS-subscription
+          PolicyDocument:
+            Version:                          2012-10-17
+            Statement:
+            - Effect:                         "Allow"
+              Action:
+              - "sns:SetSubscriptionAttributes"
+              - "sns:ListTopics"
+              - "sns:GetSubscriptionAttributes"
+              - "sns:ListSubscriptions"
+              Resource:                       "*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  EnableRawMessageForSNSTopicLambda:
+    Type:                                     AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile:                              |
+          import json, boto3, time, logging, os
+          from botocore.exceptions import ClientError
+          from botocore.vendored import requests
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+
+          session = boto3.Session()
+
+          def cfnresponse_send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False):
+              '''
+              function to signal CloudFormation custom resource
+              '''
+              responseUrl = event['ResponseURL']
+              responseBody = {}
+              responseBody['Status'] = responseStatus
+              responseBody['Reason'] = 'See the details in CloudWatch Log Stream: ' + context.log_stream_name
+              responseBody['PhysicalResourceId'] = physicalResourceId or context.log_stream_name
+              responseBody['StackId'] = event['StackId']
+              responseBody['RequestId'] = event['RequestId']
+              responseBody['LogicalResourceId'] = event['LogicalResourceId']
+              responseBody['NoEcho'] = noEcho
+              responseBody['Data'] = responseData
+              json_responseBody = json.dumps(responseBody)
+
+              headers = {
+                  'content-type' :            '',
+                  'content-length' :          str(len(json_responseBody))
+              }
+              try:
+                  response = requests.put(responseUrl,
+                                          data=json_responseBody,
+                                          headers=headers)
+                  LOGGER.info("CFN Response Status code: " + response.reason)
+              except Exception as e:
+                  LOGGER.info("CFN Response Failed: " + str(e))
+
+          def flip_sns_raw_messaging(sns_sub_arn, action='true'):
+              '''Flip the raw messaging for SNS Subscription'''
+              sns = boto3.client('sns')
+              output = False
+              attr_name = 'RawMessageDelivery'
+              try:
+                  LOGGER.info('Changing %s to: %s', attr_name, action)
+                  output = sns.set_subscription_attributes(SubscriptionArn=sns_sub_arn,
+                                                           AttributeName=attr_name,
+                                                           AttributeValue=action)
+              except Exception as exe:
+                  LOGGER.error('Unable to flip raw message setting: %s', str(exe))
+              return output
+
+          def lambda_handler(event, context):
+              LOGGER.info(json.dumps(event, default=str))
+              subscription_arn = os.environ['sub_arn']
+              response_data = {}
+              response_data["event"] = event
+              result = None
+
+              try:
+                  if event['RequestType'] == 'Delete':
+                    result = flip_sns_raw_messaging(subscription_arn, action='false')
+                  else:
+                    result = flip_sns_raw_messaging(subscription_arn, action='true')
+              except Exception as exe:
+                  LOGGER.error('Unable to process the file: %s', str(exe))
+
+              if result:
+                  cfnresponse_send(event, context, 'SUCCESS', response_data, "CustomResourcePhysicalID")
+              else:
+                  cfnresponse_send(event, context, 'FAILED', response_data, "CustomResourcePhysicalID")
+      Handler:                                index.lambda_handler
+      MemorySize:                             128
+      Role:                                   !GetAtt "SNSSubscriptionFlipExecutionRole.Arn"
+      Runtime:                                python3.7
+      Timeout:                                60
+      Environment:
+        Variables:
+            sub_arn:                          !Ref AggregateSecurityNotificationsSubscription
+
+  PermissionToInvokeLambda:
+    Type:                                     AWS::Lambda::Permission
+    Properties:
+      Action:                                 lambda:InvokeFunction
+      FunctionName:                           !GetAtt "EnableRawMessageForSNSTopicLambda.Arn"
+      Principal:                              cloudformation.amazonaws.com
+      SourceAccount:                          !Ref "AWS::AccountId"
+
+  DeployEnableRawMessageForSNSTopicLambda:
+    Type:                                     'Custom::TriggerLambda'
+    Properties:
+      ServiceToken:                           !GetAtt "EnableRawMessageForSNSTopicLambda.Arn"
+
+Parameters:
+  AuditTopicName:
+    Type:                                     String
+    Description:                              SNS Topic in Audit Account that AWS Config delivers notifications to.
+    Default:                                  'aws-controltower-AggregateSecurityNotifications'
+  PagerDutyHttpsEndpoint:
+    Type:                                     String
+    Description:                              https://events.pagerduty.com/x-ere/[YOUR_PAGERDUTY_INTEGRATION_KEY_HERE]
+    Default:                                  https://events.pagerduty.com/x-ere/[YOUR_PAGERDUTY_INTEGRATION_KEY_HERE]
+
+Outputs:
+  SNSSubscriptionArn:
+    Description:                              SubscriptionArn
+    Value:                                    !Ref AggregateSecurityNotificationsSubscription
